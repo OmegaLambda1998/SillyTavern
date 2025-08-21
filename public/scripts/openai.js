@@ -276,6 +276,7 @@ export const settingsToUpdate = {
     xai_model: ['#model_xai_select', 'xai_model', false, true],
     pollinations_model: ['#model_pollinations_select', 'pollinations_model', false, true],
     moonshot_model: ['#model_moonshot_select', 'moonshot_model', false, true],
+    fireworks_model: ['#model_fireworks_select', 'fireworks_model', false, true],
     custom_model: ['#custom_model_id', 'custom_model', false, true],
     custom_url: ['#custom_api_url_text', 'custom_url', false, true],
     custom_include_body: ['#custom_include_body', 'custom_include_body', false, true],
@@ -372,6 +373,7 @@ const default_settings = {
     xai_model: 'grok-3-beta',
     pollinations_model: 'openai',
     moonshot_model: 'kimi-latest',
+    fireworks_model: 'accounts/fireworks/models/kimi-k2-instruct',
     custom_model: '',
     custom_url: '',
     custom_include_body: '',
@@ -3405,6 +3407,7 @@ function loadOpenAISettings(data, settings) {
     oai_settings.xai_model = settings.xai_model ?? default_settings.xai_model;
     oai_settings.pollinations_model = settings.pollinations_model ?? default_settings.pollinations_model;
     oai_settings.moonshot_model = settings.moonshot_model ?? default_settings.moonshot_model;
+    oai_settings.fireworks_model = settings.fireworks_model ?? default_settings.fireworks_model;
     oai_settings.custom_model = settings.custom_model ?? default_settings.custom_model;
     oai_settings.custom_url = settings.custom_url ?? default_settings.custom_url;
     oai_settings.custom_include_body = settings.custom_include_body ?? default_settings.custom_include_body;
@@ -3674,6 +3677,7 @@ async function getStatusOpen() {
     if (noValidateSources.includes(oai_settings.chat_completion_source)) {
         let status = t`Key saved; press \"Test Message\" to verify.`;
         setOnlineStatus(status);
+        updateFeatureSupportFlags();
         return resultCheckStatus();
     }
 
@@ -3745,6 +3749,7 @@ async function getStatusOpen() {
         }
     }
 
+    updateFeatureSupportFlags();
     return resultCheckStatus();
 }
 
@@ -3777,6 +3782,7 @@ async function saveOpenAIPreset(name, settings, triggerUi = true) {
         pollinations_model: settings.pollinations_model,
         aimlapi_model: settings.aimlapi_model,
         moonshot_model: settings.moonshot_model,
+        fireworks_model: settings.fireworks_model,
         custom_model: settings.custom_model,
         custom_url: settings.custom_url,
         custom_include_body: settings.custom_include_body,
@@ -4375,10 +4381,12 @@ function getMistralMaxContext(model, isUnlocked) {
     }
 
     const contextMap = {
+        'codestral-2405': 32768,
         'codestral-2411-rc5': 262144,
         'codestral-2412': 262144,
         'codestral-2501': 262144,
-        'codestral-latest': 262144,
+        'codestral-2508': 256000,
+        'codestral-latest': 256000,
         'codestral-mamba-2407': 262144,
         'codestral-mamba-latest': 262144,
         'open-codestral-mamba': 262144,
@@ -4401,13 +4409,13 @@ function getMistralMaxContext(model, isUnlocked) {
         'pixtral-large-latest': 131072,
         'open-mixtral-8x22b': 65536,
         'open-mixtral-8x22b-2404': 65536,
-        'codestral-2405': 32768,
         'mistral-embed': 32768,
         'mistral-large-2402': 32768,
         'mistral-medium': 131072,
         'mistral-medium-2312': 32768,
         'mistral-medium-2505': 131072,
-        'mistral-medium-latest': 131072,
+        'mistral-medium-2508': 262144,
+        'mistral-medium-latest': 262144,
         'mistral-moderation-2411': 32768,
         'mistral-moderation-latest': 32768,
         'mistral-ocr-2503': 32768,
@@ -4885,7 +4893,7 @@ async function onModelChange() {
         if (oai_settings.max_context_unlocked) {
             $('#openai_max_context').attr('max', unlocked_max);
         } else if (['deepseek-reasoner', 'deepseek-chat'].includes(oai_settings.deepseek_model)) {
-            $('#openai_max_context').attr('max', max_64k);
+            $('#openai_max_context').attr('max', max_128k);
         } else if (oai_settings.deepseek_model == 'deepseek-coder') {
             $('#openai_max_context').attr('max', max_16k);
         } else {
@@ -5396,6 +5404,7 @@ export function isImageInliningSupported() {
         'mistral-small-latest',
         'mistral-medium-latest',
         'mistral-medium-2505',
+        'mistral-medium-2508',
         'pixtral',
         // xAI (Grok)
         'grok-4',
@@ -5420,17 +5429,17 @@ export function isImageInliningSupported() {
         case chat_completion_sources.CLAUDE:
             return visionSupportedModels.some(model => oai_settings.claude_model.includes(model));
         case chat_completion_sources.OPENROUTER:
-            return true;
+            return (Array.isArray(model_list) && model_list.find(m => m.id === oai_settings.openrouter_model)?.architecture?.modality === 'text+image->text');
         case chat_completion_sources.CUSTOM:
             return true;
         case chat_completion_sources.MISTRALAI:
-            return visionSupportedModels.some(model => oai_settings.mistralai_model.includes(model));
+            return (Array.isArray(model_list) && model_list.find(m => m.id === oai_settings.mistralai_model)?.capabilities?.vision);
         case chat_completion_sources.COHERE:
             return visionSupportedModels.some(model => oai_settings.cohere_model.includes(model));
         case chat_completion_sources.XAI:
             return visionSupportedModels.some(model => oai_settings.xai_model.includes(model));
         case chat_completion_sources.AIMLAPI:
-            return visionSupportedModels.some(model => oai_settings.aimlapi_model.includes(model));
+            return (Array.isArray(model_list) && model_list.find(m => m.id === oai_settings.aimlapi_model)?.features?.includes('openai/chat-completion.vision'));
         case chat_completion_sources.POLLINATIONS:
             return (Array.isArray(model_list) && model_list.find(m => m.id === oai_settings.pollinations_model)?.vision);
         case chat_completion_sources.MOONSHOT:
@@ -6029,6 +6038,7 @@ export function initOpenAI() {
 
     $('#openai_image_inlining').on('input', function () {
         oai_settings.image_inlining = !!$(this).prop('checked');
+        updateFeatureSupportFlags();
         saveSettingsDebounced();
     });
 
@@ -6039,6 +6049,7 @@ export function initOpenAI() {
 
     $('#openai_video_inlining').on('input', function () {
         oai_settings.video_inlining = !!$(this).prop('checked');
+        updateFeatureSupportFlags();
         saveSettingsDebounced();
     });
 
@@ -6049,6 +6060,7 @@ export function initOpenAI() {
 
     $('#openai_function_calling').on('input', function () {
         oai_settings.function_calling = !!$(this).prop('checked');
+        updateFeatureSupportFlags();
         saveSettingsDebounced();
     });
 
@@ -6074,6 +6086,7 @@ export function initOpenAI() {
 
     $('#custom_prompt_post_processing').on('change', function () {
         oai_settings.custom_prompt_post_processing = String($(this).val());
+        updateFeatureSupportFlags();
         saveSettingsDebounced();
     });
 
