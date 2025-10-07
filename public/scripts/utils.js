@@ -7,7 +7,7 @@ import {
 } from '../lib.js';
 
 import { getContext } from './extensions.js';
-import { characters, getRequestHeaders, this_chid, user_avatar } from '../script.js';
+import { characters, getRequestHeaders, processDroppedFiles, this_chid, user_avatar } from '../script.js';
 import { isMobile } from './RossAscends-mods.js';
 import { collapseNewlines, power_user } from './power-user.js';
 import { debounce_timeout } from './constants.js';
@@ -16,6 +16,7 @@ import { SlashCommandClosure } from './slash-commands/SlashCommandClosure.js';
 import { getTagsList } from './tags.js';
 import { groups, selected_group } from './group-chats.js';
 import { getCurrentLocale, t } from './i18n.js';
+import { importWorldInfo } from './world-info.js';
 
 /**
  * Pagination status string template.
@@ -285,6 +286,15 @@ export function removeFromArray(array, item) {
     if (index === -1) return false;
     array.splice(index, 1);
     return true;
+}
+
+/**
+ * Normalizes an array by removing duplicates, trimming strings, and filtering out empty values.
+ * @param {any[]} arr - The array to normalize.
+ * @returns {any[]} The normalized array.
+ */
+export function normalizeArray(arr) {
+    return [...new Set((arr ?? []).map(s => typeof s === 'string' ? s.trim() : s).filter(Boolean))];
 }
 
 /**
@@ -619,7 +629,7 @@ export function isElementInViewport(el) {
 /**
  * Returns a name that is unique among the names that exist.
  * @param {string} name The name to check.
- * @param {{ (y: any): boolean; }} exists Function to check if name exists.
+ * @param {{ (name: string): boolean; }} exists Function to check if name exists.
  * @returns {string} A unique name.
  */
 export function getUniqueName(name, exists) {
@@ -1636,13 +1646,18 @@ export function createThumbnail(dataUrl, maxWidth = null, maxHeight = null, type
  * @param {{ (): boolean; }} condition The condition to wait for.
  * @param {number} [timeout=1000] The timeout in milliseconds.
  * @param {number} [interval=100] The interval in milliseconds.
+ * @param {object} [options] Options object
+ * @param {boolean} [options.rejectOnTimeout=true] Whether to reject the promise on timeout or resolve it.
  * @returns {Promise<void>} A promise that resolves when the condition is true.
  */
-export async function waitUntilCondition(condition, timeout = 1000, interval = 100) {
+export async function waitUntilCondition(condition, timeout = 1000, interval = 100, options = {}) {
+    const { rejectOnTimeout = true } = options;
+
     return new Promise((resolve, reject) => {
         const timeoutId = setTimeout(() => {
             clearInterval(intervalId);
-            reject(new Error('Timed out waiting for condition to be true'));
+            const timeoutFn = rejectOnTimeout ? reject : resolve;
+            timeoutFn(new Error('Timed out waiting for condition to be true'));
         }, timeout);
 
         const intervalId = setInterval(() => {
@@ -2612,4 +2627,61 @@ export function setupScrollToTop({ scrollContainerId, buttonId, drawerId, visibi
         scrollContainer.removeEventListener('scroll', onScroll);
         btn.removeEventListener('click', onActivate);
     };
+}
+
+/**
+ * Imports content from an external URL.
+ * @param {string} url URL or UUID of the content to import.
+ * @param {Object} [options={}] Options object.
+ * @param {string|null} [options.preserveFileName=null] Optional file name to use for the imported content.
+ * @returns {Promise<void>} A promise that resolves when the import is complete.
+ */
+export async function importFromExternalUrl(url, { preserveFileName = null } = {}) {
+    let request;
+
+    if (isValidUrl(url)) {
+        console.debug('Custom content import started for URL: ', url);
+        request = await fetch('/api/content/importURL', {
+            method: 'POST',
+            headers: getRequestHeaders(),
+            body: JSON.stringify({ url }),
+        });
+    } else {
+        console.debug('Custom content import started for Char UUID: ', url);
+        request = await fetch('/api/content/importUUID', {
+            method: 'POST',
+            headers: getRequestHeaders(),
+            body: JSON.stringify({ url }),
+        });
+    }
+
+    if (!request.ok) {
+        toastr.info(request.statusText, 'Custom content import failed');
+        console.error('Custom content import failed', request.status, request.statusText);
+        return;
+    }
+
+    const data = await request.blob();
+    const customContentType = request.headers.get('X-Custom-Content-Type');
+    let fileName = request.headers.get('Content-Disposition').split('filename=')[1].replace(/"/g, '');
+    const file = new File([data], fileName, { type: data.type });
+
+    const extraData = new Map();
+    if (preserveFileName) {
+        fileName = preserveFileName;
+        extraData.set(file, preserveFileName);
+    }
+
+    switch (customContentType) {
+        case 'character':
+            await processDroppedFiles([file], extraData);
+            break;
+        case 'lorebook':
+            await importWorldInfo(file);
+            break;
+        default:
+            toastr.warning('Unknown content type');
+            console.error('Unknown content type', customContentType);
+            break;
+    }
 }
