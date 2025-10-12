@@ -87,6 +87,8 @@ export const event_types = {
     SECRET_EDITED: 'secret_edited',
     PRESET_CHANGED: 'preset_changed',
     PRESET_DELETED: 'preset_deleted',
+    PRESET_RENAMED: 'preset_renamed',
+    PRESET_RENAMED_BEFORE: 'preset_renamed_before',
     MAIN_API_CHANGED: 'main_api_changed',
     WORLDINFO_ENTRIES_LOADED: 'worldinfo_entries_loaded',
 };
