@@ -179,6 +179,7 @@ import {
     importFromExternalUrl,
     shiftUpByOne,
     shiftDownByOne,
+    canUseNegativeLookbehind,
 } from './scripts/utils.js';
 import { debounce_timeout, GENERATION_TYPE_TRIGGERS, IGNORE_SYMBOL, inject_ids } from './scripts/constants.js';
 
@@ -409,6 +410,7 @@ let fav_ch_checked = false;
 let scrollLock = false;
 export let abortStatusCheck = new AbortController();
 export let charDragDropHandler = null;
+export let chatDragDropHandler = null;
 
 /** @type {debounce_timeout} The debounce timeout used for chat/settings save. debounce_timeout.long: 1.000 ms */
 export const DEFAULT_SAVE_EDIT_TIMEOUT = debounce_timeout.relaxed;
@@ -553,9 +555,10 @@ export let is_send_press = false; //Send generation
 
 let this_del_mes = -1;
 
-//message editing
-var this_edit_mes_chname = '';
-var this_edit_mes_id;
+/** @type {string} */
+let this_edit_mes_chname = '';
+/** @type {number|undefined} */
+let this_edit_mes_id = undefined;
 
 //settings
 export let settings;
@@ -1464,6 +1467,69 @@ export async function deleteLastMessage() {
     await eventSource.emit(event_types.MESSAGE_DELETED, chat.length);
 }
 
+/**
+ * Deletes a message from the chat by its ID, optionally asking for confirmation.
+ * @param {number} id The ID of the message to delete.
+ * @param {number} [swipeDeletionIndex] Deletes the swipe with that index.
+ * @param {boolean} [askConfirmation=false] Whether to ask for confirmation before deleting.
+ */
+export async function deleteMessage(id, swipeDeletionIndex = undefined, askConfirmation = false) {
+    const canDeleteSwipe = swipeDeletionIndex !== undefined && swipeDeletionIndex !== null;
+    if (canDeleteSwipe) {
+        if (swipeDeletionIndex < 0) {
+            throw new Error('Swipe index cannot be negative');
+        }
+        if (!Array.isArray(chat[id].swipes)) {
+            throw new Error('Message has no swipes to delete');
+        }
+        if (chat[id].swipes.length <= swipeDeletionIndex) {
+            throw new Error('Swipe index out of bounds');
+        }
+    }
+
+    const minId = getFirstDisplayedMessageId();
+    const messageElement = chatElement.find(`.mes[mesid="${id}"]`);
+    if (messageElement.length === 0) {
+        return;
+    }
+
+    let deleteOnlySwipe = canDeleteSwipe;
+    if (askConfirmation) {
+        const result = await callGenericPopup(t`Are you sure you want to delete this message?`, POPUP_TYPE.CONFIRM, null, {
+            okButton: canDeleteSwipe ? t`Delete Swipe` : t`Delete Message`,
+            cancelButton: 'Cancel',
+            customButtons: canDeleteSwipe ? [t`Delete Message`] : null,
+        });
+        if (!result) {
+            return;
+        }
+        deleteOnlySwipe = canDeleteSwipe && result === POPUP_RESULT.AFFIRMATIVE; // Default button, not the custom one
+    }
+
+    if (deleteOnlySwipe) {
+        await deleteSwipe(swipeDeletionIndex, id);
+        return;
+    }
+
+    chat.splice(id, 1);
+    messageElement.remove();
+
+    chat_metadata['tainted'] = true;
+
+    const startIndex = [0, minId].includes(id) ? id : null;
+    updateViewMessageIds(startIndex);
+    await saveChatConditional();
+
+    if (this_edit_mes_id === id) {
+        this_edit_mes_id = undefined;
+    }
+
+    hideSwipeButtons();
+    showSwipeButtons();
+
+    await eventSource.emit(event_types.MESSAGE_DELETED, chat.length);
+}
+
 export async function reloadCurrentChat() {
     preserveNeutralChat();
     await clearChat();
@@ -1493,7 +1559,7 @@ export async function reloadCurrentChat() {
 export async function sendTextareaMessage() {
     if (is_send_press) return;
     if (isExecutingCommandsFromChatInput) return;
-    if (this_edit_mes_id) return; // don't proceed if editing a message
+    if (this_edit_mes_id >= 0) return; // don't proceed if editing a message
 
     let generateType;
     // "Continue on send" is activated when the user hits "send" (or presses enter) on an empty chat box, and the last
@@ -1596,7 +1662,9 @@ export function messageFormatting(mes, ch_name, isSystem, isUser, messageId, san
     }
 
     if (!isSystem && power_user.encode_tags) {
-        mes = mes.replaceAll('<', '&lt;').replaceAll('>', '&gt;');
+        mes = canUseNegativeLookbehind()
+            ? mes.replaceAll('<', '&lt;').replace(new RegExp('(?<!^|\\n\\s*)>', 'g'), '&gt;')
+            : mes.replaceAll('<', '&lt;').replaceAll('>', '&gt;');
     }
 
     // Make sure reasoning strings are always shown, even if they include "<" or ">"
@@ -7209,6 +7277,116 @@ function messageEditAuto(div) {
     saveChatDebounced();
 }
 
+/**
+ * Create the message edit UI.
+ * @param {number} edit_mes_id
+ */
+async function messageEdit(edit_mes_id) {
+    hideSwipeButtons();
+    let chatScrollPosition = chatElement.scrollTop();
+
+    this_edit_mes_id = edit_mes_id;
+
+    let thisMesDiv = chatElement.children().filter(`.mes[mesid="${edit_mes_id}"]`);
+
+    let thisMesBlock = thisMesDiv.find('.mes_block');
+    let thisMesText = thisMesBlock.find('.mes_text');
+
+    thisMesText.empty();
+    thisMesBlock.find('.mes_buttons').css('display', 'none');
+    thisMesBlock.find('.mes_edit_buttons').css('display', 'inline-flex');
+
+    // Also edit reasoning, if it exists
+    const reasoningEdit = thisMesBlock.find('.mes_reasoning_edit:visible');
+    if (reasoningEdit.length > 0) {
+        reasoningEdit.trigger('click');
+    }
+
+    let text = chat[edit_mes_id]['mes'];
+    if (chat[edit_mes_id]['is_user']) {
+        this_edit_mes_chname = name1;
+    } else if (chat[edit_mes_id]['force_avatar']) {
+        this_edit_mes_chname = chat[edit_mes_id]['name'];
+    } else {
+        this_edit_mes_chname = name2;
+    }
+    if (power_user.trim_spaces) {
+        text = text.trim();
+    }
+    thisMesText.append(
+        '<textarea id=\'curEditTextarea\' class=\'edit_textarea mdHotkeys\'></textarea>',
+    );
+
+    let edit_textarea = thisMesBlock.find('.edit_textarea');
+    edit_textarea.val(text);
+
+    const cssAutofit = CSS.supports('field-sizing', 'content');
+    if (!cssAutofit) {
+        edit_textarea.height(0);
+        edit_textarea.height(edit_textarea[0].scrollHeight);
+    }
+    edit_textarea.trigger('focus');
+    const textAreaElement = /** @type {HTMLTextAreaElement} */ (edit_textarea[0]);
+    // Sets the cursor at the end of the text
+    textAreaElement.setSelectionRange(
+        String(edit_textarea.val()).length,
+        String(edit_textarea.val()).length,
+    );
+    if (Number(this_edit_mes_id) === chat.length - 1) {
+        chatElement.scrollTop(chatScrollPosition);
+    }
+
+    updateEditArrowClasses();
+}
+
+/**
+ * Close the open message editor.
+ * This deletes the user's unsaved changes.
+ * @param {number} [messageId=this_edit_mes_id]
+ */
+async function messageEditCancel(messageId = this_edit_mes_id) {
+    let text = chat[messageId]['mes'];
+    let thisMesDiv;
+    // If this is the button then select it's parent. Otherwise, select by messageId.
+    if (this?.classList?.contains('mes_edit_cancel')) {
+        thisMesDiv = $(this).closest('.mes');
+    } else {
+        thisMesDiv = chatElement.children().filter(`[mesid="${messageId}"]`);
+    }
+
+    const thisMesBlock = thisMesDiv.find('.mes_block');
+    thisMesBlock.find('.mes_text').empty();
+    thisMesDiv.find('.mes_edit_buttons').css('display', 'none');
+    thisMesBlock.find('.mes_buttons').css('display', '');
+    thisMesBlock.find('.mes_text')
+        .append(messageFormatting(
+            text,
+            this_edit_mes_chname,
+            chat[messageId].is_system,
+            chat[messageId].is_user,
+            messageId,
+            {},
+            false,
+        ));
+    appendMediaToMessage(chat[messageId], thisMesDiv);
+    addCopyToCodeBlocks(thisMesDiv);
+
+    const reasoningEditDone = thisMesBlock.find('.mes_reasoning_edit_cancel:visible');
+    if (reasoningEditDone.length > 0) {
+        reasoningEditDone.trigger('click');
+    }
+
+    await eventSource.emit(event_types.MESSAGE_UPDATED, messageId);
+    if (messageId == this_edit_mes_id) {
+        this_edit_mes_id = undefined;
+    }
+    else {
+        console.warn(`The message editor was closed on message #${messageId} while #${this_edit_mes_id} is being edited.`);
+    }
+
+    showSwipeButtons();
+}
+
 async function messageEditDone(div) {
     let { mesBlock, text, mes, bias } = updateMessage(div);
     if (this_edit_mes_id == 0) {
@@ -7244,6 +7422,7 @@ async function messageEditDone(div) {
     await eventSource.emit(event_types.MESSAGE_UPDATED, this_edit_mes_id);
     this_edit_mes_id = undefined;
     await saveChatConditional();
+    showSwipeButtons();
 }
 
 /**
@@ -7359,8 +7538,9 @@ export function getCurrentChatDetails() {
  * The function first fetches the chats, processes them, and then displays them in
  * the HTML. It also has a built-in search functionality that allows filtering the
  * displayed chats based on a search query.
+ * @param {string[]} hightlightNames - An array of chat names to highlight
  */
-export async function displayPastChats() {
+export async function displayPastChats(hightlightNames = []) {
     $('#select_chat_div').empty();
     $('#select_chat_search').val('').off('input');
 
@@ -7369,10 +7549,10 @@ export async function displayPastChats() {
     const displayName = chatDetails.characterName;
     const avatarImg = chatDetails.avatarImgURL;
 
-    await displayChats('', currentChat, displayName, avatarImg, selected_group);
+    await displayChats('', currentChat, displayName, avatarImg, selected_group, hightlightNames);
 
     const debouncedDisplay = debounce((searchQuery) => {
-        displayChats(searchQuery, currentChat, displayName, avatarImg, selected_group);
+        displayChats(searchQuery, currentChat, displayName, avatarImg, selected_group, []);
     });
 
     // Define the search input listener
@@ -7388,7 +7568,7 @@ export async function displayPastChats() {
     }, 200);
 }
 
-async function displayChats(searchQuery, currentChat, displayName, avatarImg, selected_group) {
+async function displayChats(searchQuery, currentChat, displayName, avatarImg, selected_group, highlightNames) {
     try {
         const trimExtension = (fileName) => String(fileName).replace('.jsonl', '');
 
@@ -7428,6 +7608,12 @@ async function displayChats(searchQuery, currentChat, displayName, avatarImg, se
             }
 
             $('#select_chat_div').append(template);
+
+            if (Array.isArray(highlightNames) && highlightNames.includes(chat.file_name)) {
+                const templateOffset = template.offset().top - template.parent().offset().top;
+                $('#select_chat_div').scrollTop(templateOffset);
+                flashHighlight(template, debounce_timeout.extended);
+            }
         }
     } catch (error) {
         console.error('Error loading chats:', error);
@@ -7893,7 +8079,7 @@ export function callPopup(text, type, inputValue = '', { okButton, rows, wide, w
 }
 
 export function showSwipeButtons() {
-    if (chat.length === 0) {
+    if (chat.length === 0 || this_edit_mes_id >= 0) {
         return;
     }
 
@@ -8000,6 +8186,8 @@ export async function deleteSwipe(swipeId = null, messageId = chat.length - 1) {
     const newSwipeId = Math.min(swipeId, message.swipes.length - 1);
     syncSwipeToMes(messageId, newSwipeId);
 
+    chat_metadata['tainted'] = true;
+
     await eventSource.emit(event_types.MESSAGE_SWIPE_DELETED, { messageId, swipeId, newSwipeId });
 
     await saveChatConditional();
@@ -8050,9 +8238,11 @@ export async function saveChatConditional() {
 /**
  * Saves the chat to the server.
  * @param {FormData} formData Form data to send to the server.
- * @param {EventTarget} eventTarget Event target to trigger the event on.
+ * @param {object} [options={}] Options for the import
+ * @param {boolean} [options.refresh] Whether to refresh the group chat list after import
+ * @returns {Promise<string[]>} List of imported file names.
  */
-async function importCharacterChat(formData, eventTarget) {
+async function importCharacterChat(formData, { refresh = true } = {}) {
     const fetchResult = await fetch('/api/chats/import', {
         method: 'POST',
         body: formData,
@@ -8062,18 +8252,17 @@ async function importCharacterChat(formData, eventTarget) {
 
     if (fetchResult.ok) {
         const data = await fetchResult.json();
-        if (data.res) {
+        if (data.res && refresh) {
             await displayPastChats();
         }
+        return data?.fileNames || [];
     }
 
-    if (eventTarget instanceof HTMLInputElement) {
-        eventTarget.value = '';
-    }
+    return [];
 }
 
-function updateViewMessageIds(startFromZero = false) {
-    const minId = startFromZero ? 0 : getFirstDisplayedMessageId();
+function updateViewMessageIds(startIndex = null) {
+    const minId = startIndex ?? getFirstDisplayedMessageId();
 
     chatElement.find('.mes').each(function (index, element) {
         $(element).attr('mesid', minId + index);
@@ -8096,7 +8285,7 @@ function updateEditArrowClasses() {
     chatElement.find('.mes .mes_edit_up').removeClass('disabled');
     chatElement.find('.mes .mes_edit_down').removeClass('disabled');
 
-    if (this_edit_mes_id !== undefined) {
+    if (this_edit_mes_id >= 0) {
         const down = chatElement.find(`.mes[mesid="${this_edit_mes_id}"] .mes_edit_down`);
         const up = chatElement.find(`.mes[mesid="${this_edit_mes_id}"] .mes_edit_up`);
         const lastId = Number(chatElement.find('.mes').last().attr('mesid'));
@@ -8118,7 +8307,7 @@ function updateEditArrowClasses() {
  */
 export function closeMessageEditor(what = 'all') {
     if (what === 'message' || what === 'all') {
-        if (this_edit_mes_id) {
+        if (this_edit_mes_id >= 0) {
             chatElement.find(`.mes[mesid="${this_edit_mes_id}"] .mes_edit_cancel`).trigger('click');
         }
     }
@@ -10037,7 +10226,7 @@ jQuery(async function () {
         }
 
         else if (id == 'option_continue') {
-            if (this_edit_mes_id) return; // don't proceed if editing a message
+            if (this_edit_mes_id >= 0) return; // don't proceed if editing a message
 
             if (is_send_press == false || fromSlashCommand) {
                 is_send_press = true;
@@ -10227,8 +10416,7 @@ jQuery(async function () {
                 return;
             }*/
 
-            let chatScrollPosition = chatElement.scrollTop();
-            if (this_edit_mes_id !== undefined) {
+            if (this_edit_mes_id >= 0) {
                 let mes_edited = chatElement.find(`[mesid="${this_edit_mes_id}"]`).find('.mes_edit_done');
                 if (Number(edit_mes_id) == chat.length - 1) { //if the generating swipe (...)
                     let run_edit = true;
@@ -10243,55 +10431,9 @@ jQuery(async function () {
                 }
                 await messageEditDone(mes_edited);
             }
-            $(this).closest('.mes_block').find('.mes_text').empty();
-            $(this).closest('.mes_block').find('.mes_buttons').css('display', 'none');
-            $(this).closest('.mes_block').find('.mes_edit_buttons').css('display', 'inline-flex');
-            var edit_mes_id = $(this).closest('.mes').attr('mesid');
-            this_edit_mes_id = edit_mes_id;
+            var edit_mes_id = Number($(this).closest('.mes').attr('mesid'));
 
-            // Also edit reasoning, if it exists
-            const reasoningEdit = $(this).closest('.mes_block').find('.mes_reasoning_edit:visible');
-            if (reasoningEdit.length > 0) {
-                reasoningEdit.trigger('click');
-            }
-
-            var text = chat[edit_mes_id]['mes'];
-            if (chat[edit_mes_id]['is_user']) {
-                this_edit_mes_chname = name1;
-            } else if (chat[edit_mes_id]['force_avatar']) {
-                this_edit_mes_chname = chat[edit_mes_id]['name'];
-            } else {
-                this_edit_mes_chname = name2;
-            }
-            if (power_user.trim_spaces) {
-                text = text.trim();
-            }
-            $(this)
-                .closest('.mes_block')
-                .find('.mes_text')
-                .append(
-                    '<textarea id=\'curEditTextarea\' class=\'edit_textarea mdHotkeys\'></textarea>',
-                );
-            $('#curEditTextarea').val(text);
-            let edit_textarea = $(this)
-                .closest('.mes_block')
-                .find('.edit_textarea');
-            if (!cssAutofit) {
-                edit_textarea.height(0);
-                edit_textarea.height(edit_textarea[0].scrollHeight);
-            }
-            edit_textarea.trigger('focus');
-            const textAreaElement = /** @type {HTMLTextAreaElement} */ (edit_textarea[0]);
-            // Sets the cursor at the end of the text
-            textAreaElement.setSelectionRange(
-                String(edit_textarea.val()).length,
-                String(edit_textarea.val()).length,
-            );
-            if (Number(this_edit_mes_id) === chat.length - 1) {
-                chatElement.scrollTop(chatScrollPosition);
-            }
-
-            updateEditArrowClasses();
+            await messageEdit(edit_mes_id);
         }
     });
 
@@ -10370,33 +10512,7 @@ jQuery(async function () {
     });
 
     $(document).on('click', '.mes_edit_cancel', async function () {
-        let text = chat[this_edit_mes_id]['mes'];
-
-        $(this).closest('.mes_block').find('.mes_text').empty();
-        $(this).closest('.mes_edit_buttons').css('display', 'none');
-        $(this).closest('.mes_block').find('.mes_buttons').css('display', '');
-        $(this)
-            .closest('.mes_block')
-            .find('.mes_text')
-            .append(messageFormatting(
-                text,
-                this_edit_mes_chname,
-                chat[this_edit_mes_id].is_system,
-                chat[this_edit_mes_id].is_user,
-                this_edit_mes_id,
-                {},
-                false,
-            ));
-        appendMediaToMessage(chat[this_edit_mes_id], $(this).closest('.mes'));
-        addCopyToCodeBlocks($(this).closest('.mes'));
-
-        const reasoningEditDone = $(this).closest('.mes_block').find('.mes_reasoning_edit_cancel:visible');
-        if (reasoningEditDone.length > 0) {
-            reasoningEditDone.trigger('click');
-        }
-
-        await eventSource.emit(event_types.MESSAGE_UPDATED, this_edit_mes_id);
-        this_edit_mes_id = undefined;
+        await messageEditCancel.call(this, this_edit_mes_id);
     });
 
     $(document).on('click', '.mes_edit_up', async function () {
@@ -10404,7 +10520,6 @@ jQuery(async function () {
             return;
         }
 
-        hideSwipeButtons();
         const targetId = Number(this_edit_mes_id) - 1;
         const target = chatElement.find(`.mes[mesid="${targetId}"]`);
         const root = $(this).closest('.mes');
@@ -10425,7 +10540,6 @@ jQuery(async function () {
         this_edit_mes_id = targetId;
         updateViewMessageIds();
         await saveChatConditional();
-        showSwipeButtons();
     });
 
     $(document).on('click', '.mes_edit_down', async function () {
@@ -10433,7 +10547,6 @@ jQuery(async function () {
             return;
         }
 
-        hideSwipeButtons();
         const targetId = Number(this_edit_mes_id) + 1;
         const target = chatElement.find(`.mes[mesid="${targetId}"]`);
         const root = $(this).closest('.mes');
@@ -10454,7 +10567,6 @@ jQuery(async function () {
         this_edit_mes_id = targetId;
         updateViewMessageIds();
         await saveChatConditional();
-        showSwipeButtons();
     });
 
     $(document).on('click', '.mes_edit_copy', async function () {
@@ -10484,48 +10596,11 @@ jQuery(async function () {
 
     $(document).on('click', '.mes_edit_delete', async function (event, customData) {
         const fromSlashCommand = customData?.fromSlashCommand || false;
-        const canDeleteSwipe = (Array.isArray(chat[this_edit_mes_id].swipes) && chat[this_edit_mes_id].swipes.length > 1 && !chat[this_edit_mes_id].is_user && parseInt(this_edit_mes_id) === chat.length - 1);
-
-        let deleteOnlySwipe = false;
-        if (power_user.confirm_message_delete && fromSlashCommand !== true) {
-            const result = await callGenericPopup(t`Are you sure you want to delete this message?`, POPUP_TYPE.CONFIRM, null, {
-                okButton: canDeleteSwipe ? t`Delete Swipe` : t`Delete Message`,
-                cancelButton: 'Cancel',
-                customButtons: canDeleteSwipe ? [t`Delete Message`] : null,
-            });
-            if (!result) {
-                return;
-            }
-            deleteOnlySwipe = canDeleteSwipe && result === 1; // Default button, not the custom one
-        }
-
-        const messageElement = $(this).closest('.mes');
-        if (!messageElement) {
-            return;
-        }
-
-        if (deleteOnlySwipe) {
-            const message = chat[this_edit_mes_id];
-            const swipe_id = message.swipe_id;
-            await deleteSwipe(swipe_id, Number(this_edit_mes_id));
-            return;
-        }
-
-        chat.splice(this_edit_mes_id, 1);
-        messageElement.remove();
-
-        let startFromZero = Number(this_edit_mes_id) === 0;
-
-        this_edit_mes_id = undefined;
-        chat_metadata['tainted'] = true;
-
-        updateViewMessageIds(startFromZero);
-        saveChatDebounced();
-
-        hideSwipeButtons();
-        showSwipeButtons();
-
-        await eventSource.emit(event_types.MESSAGE_DELETED, chat.length);
+        const message = chat[this_edit_mes_id];
+        const selectedSwipe = message['swipe_id'] ?? undefined;
+        const swipesArray = Array.isArray(message['swipes']) ? message['swipes'] : [];
+        const canDeleteSwipe = !fromSlashCommand && !message.is_user && swipesArray.length > 1 && this_edit_mes_id === chat.length - 1 && selectedSwipe !== undefined;
+        await deleteMessage(Number(this_edit_mes_id), canDeleteSwipe ? selectedSwipe : undefined, power_user.confirm_message_delete && fromSlashCommand !== true);
     });
 
     $(document).on('click', '.mes_edit_done', async function () {
@@ -10612,41 +10687,45 @@ jQuery(async function () {
     });
 
     $('#chat_import_file').on('change', async function (e) {
-        const targetElement = /** @type {HTMLInputElement} */ (e.target);
-        if (!(targetElement instanceof HTMLInputElement)) {
-            return;
-        }
-        const file = targetElement.files[0];
-
-        if (!file) {
+        const targetElement = e.target;
+        const formElement = document.getElementById('form_import_chat');
+        if (!(targetElement instanceof HTMLInputElement) || !(formElement instanceof HTMLFormElement)) {
             return;
         }
 
-        const ext = file.name.match(/\.(\w+)$/);
-        if (
-            !ext ||
-            (ext[1].toLowerCase() != 'json' && ext[1].toLowerCase() != 'jsonl')
-        ) {
-            return;
+        const importedFileNames = [];
+
+        for (const file of targetElement.files) {
+            const ext = file.name.match(/\.(\w+)$/);
+            const format = ext?.[1]?.toLowerCase();
+
+            if (!['json', 'jsonl'].includes(format)) {
+                toastr.warning(t`Only JSON and JSONL files are supported for chat imports.`);
+                continue;
+            }
+
+            if (selected_group && format === 'json') {
+                toastr.warning(t`Only SillyTavern's own format is supported for group chat imports. Sorry!`);
+                continue;
+            }
+
+            const formData = new FormData(formElement);
+            formData.set('file_type', format);
+            formData.set('avatar', file);
+            formData.set('user_name', name1);
+
+            const importFn = selected_group ? importGroupChat : importCharacterChat;
+            const result = await importFn(formData, { refresh: false });
+            importedFileNames.push(...result);
         }
 
-        if (selected_group && file.name.endsWith('.json')) {
-            toastr.warning('Only SillyTavern\'s own format is supported for group chat imports. Sorry!');
-            return;
+        if (importedFileNames.length > 0) {
+            toastr.success(t`Successfully imported ${importedFileNames.length} chat(s).`);
         }
 
-        const format = ext[1].toLowerCase();
-        $('#chat_import_file_type').val(format);
+        await displayPastChats(importedFileNames);
 
-        const formData = new FormData(/** @type {HTMLFormElement} */($('#form_import_chat').get(0)));
-        formData.append('user_name', name1);
-        $('#select_chat_div').html('');
-
-        if (selected_group) {
-            await importGroupChat(formData, e.originalEvent.target);
-        } else {
-            await importCharacterChat(formData, e.originalEvent.target);
-        }
+        targetElement.value = '';
     });
 
     $('#rm_button_group_chats').on('click', function () {
@@ -10873,7 +10952,7 @@ jQuery(async function () {
                 $('#send_textarea').trigger('focus');
                 return;
             }
-            if (!this_edit_mes_id && $('#mes_stop').is(':visible')) {
+            if (this_edit_mes_id === undefined && $('#mes_stop').is(':visible')) {
                 $('#mes_stop').trigger('click');
                 if (chat.length && Array.isArray(chat[chat.length - 1].swipes) && chat[chat.length - 1].swipe_id == chat[chat.length - 1].swipes.length) {
                     $('.last_mes .swipe_left').trigger('click');
@@ -11091,6 +11170,14 @@ jQuery(async function () {
         }
         await processDroppedFiles(files);
     }, { noAnimation: true });
+
+    chatDragDropHandler = new DragAndDropHandler('#select_chat_popup', async (_, event) => {
+        const importFile = document.getElementById('chat_import_file');
+        if (importFile instanceof HTMLInputElement) {
+            importFile.files = event.originalEvent.dataTransfer.files;
+            $(importFile).trigger('change');
+        }
+    });
 
     $('#charListGridToggle').on('click', async () => {
         doCharListDisplaySwitch();
