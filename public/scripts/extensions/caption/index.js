@@ -489,6 +489,8 @@ jQuery(async function () {
                         'vertexai': SECRET_KEYS.VERTEXAI,
                         'anthropic': SECRET_KEYS.CLAUDE,
                         'xai': SECRET_KEYS.XAI,
+                        'zai': SECRET_KEYS.ZAI,
+                        'moonshot': SECRET_KEYS.MOONSHOT,
                     };
 
                     if (reverseProxyApis[api]) {
@@ -502,11 +504,9 @@ jQuery(async function () {
                         'groq': SECRET_KEYS.GROQ,
                         'cohere': SECRET_KEYS.COHERE,
                         'aimlapi': SECRET_KEYS.AIMLAPI,
-                        'moonshot': SECRET_KEYS.MOONSHOT,
                         'nanogpt': SECRET_KEYS.NANOGPT,
                         'chutes': SECRET_KEYS.CHUTES,
                         'electronhub': SECRET_KEYS.ELECTRONHUB,
-                        'zai': SECRET_KEYS.ZAI,
                     };
 
                     if (chatCompletionApis[api] && secret_state[chatCompletionApis[api]]) {
@@ -602,7 +602,7 @@ jQuery(async function () {
             const modelIds = await response.json();
             if (Array.isArray(modelIds) && modelIds.length > 0) {
                 modelIds.sort().forEach((modelId) => {
-                    if (!modelId || typeof modelId !== 'string' || options.some(o => o.value === modelId)) {
+                    if (!modelId || typeof modelId !== 'string' || options.some(o => o.value === modelId && o.dataset.type === api)) {
                         return;
                     }
                     const option = document.createElement('option');

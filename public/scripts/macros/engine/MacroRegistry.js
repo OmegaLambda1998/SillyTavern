@@ -1,6 +1,9 @@
 /** @typedef {import('chevrotain').CstNode} CstNode */
 /** @typedef {import('./MacroEnv.types.js').MacroEnv} MacroEnv */
 /** @typedef {import('./MacroCstWalker.js').MacroCall} MacroCall */
+/** @typedef {import('./MacroFlags.js').MacroFlags} MacroFlags */
+
+import { MACRO_IDENTIFIER_PATTERN } from './MacroLexer.js';
 
 import { isFalseBoolean, isTrueBoolean } from '../../utils.js';
 import { MacroEngine } from './MacroEngine.js';
@@ -34,6 +37,8 @@ export const MacroCategory = Object.freeze({
     STATE: 'state',
     /** Macros that don't fit in any of the other categories, but don't really need/deserve their own */
     MISC: 'misc',
+    /** Macros that are registered but not assigned to a category (any macro should have a category, so let the extension author know...) */
+    UNCATEGORIZED: 'uncategorized',
 });
 
 /**
@@ -57,7 +62,7 @@ export const MacroValueType = Object.freeze({
 /**
  * @typedef {Object} MacroDefinitionOptions
  * @property {MacroAliasDef[]} [aliases] - Alternative names for this macro. Each alias creates a lookup entry pointing to the same definition.
- * @property {MacroCategory|string} category - Category for grouping in documentation/autocomplete. Use MacroCategory enum values or a custom string.
+ * @property {MacroCategory|string} [category=MacroCategory.UNCATEGORIZED] - Category for grouping in documentation/autocomplete. Use MacroCategory enum values or a custom string.
  * @property {number|MacroUnnamedArgDef[]} [unnamedArgs=0] - Specifies the macro's unnamed positional arguments. Can be a number (all required) or an array of definitions (supports optional args). Optional args must be a suffix.
  * @property {boolean|MacroListSpec} [list] - Whether the macro allows a list of arguments (optional min and max values can be set). These arguments will be added AFTER the unnamed args.
  * @property {boolean} [strictArgs=true] - Whether the macro should be strict about its arguments.
@@ -66,6 +71,7 @@ export const MacroValueType = Object.freeze({
  * @property {MacroValueType|MacroValueType[]} [returnType=MacroValueType.STRING] - The type(s) this macro returns. Defaults to string.
  * @property {string} [displayOverride] - Override the auto-generated macro signature for display (must include curly braces, e.g. "{{macro::arg}}").
  * @property {string|string[]} [exampleUsage] - Example usage(s) shown in documentation (must include curly braces).
+ * @property {boolean} [delayArgResolution=false] - If true, nested macros in arguments or scope are NOT resolved before calling the handler. The handler receives raw argument text and must call resolve() manually. Use sparingly - only for control-flow macros like {{if}}.
  * @property {MacroHandler} handler - The handler function for the macro.
  */
 
@@ -98,15 +104,21 @@ export const MacroValueType = Object.freeze({
 /**
  * @typedef {Object} MacroExecutionContext
  * @property {string} name
- * @property {string[]} args - All unnamed arguments passed to the macro.
+ * @property {string[]} args - All unnamed arguments passed to the macro. If delayArgResolution is true, these contain raw (unresolved) text.
  * @property {string[]} unnamedArgs - Unnamed positional arguments (both required and optional, up to the defined count).
  * @property {string[]|null} list - List arguments (after unnamed args), or null if list is not enabled.
  * @property {{ [key: string]: string }|null} namedArgs - Reserved for future named argument support.
- * @property {string} raw
+ * @property {MacroFlags} flags - Macro execution flags that were applied to this macro invocation.
+ * @property {boolean} isScoped - Whether this macro was invoked using scoped syntax (opening + closing tags).
+ * @property {string} raw - The inner macro content with nested macros resolved.
+ * @property {string} rawOriginal - The original full macro text including braces, before any resolution.
+ * @property {string[]} rawArgs - The original arguments passed to the macro (always unresolved).
  * @property {MacroEnv} env
  * @property {CstNode|null} cstNode
  * @property {{ startOffset: number, endOffset: number }|null} range
  * @property {(value: any) => string} normalize - Normalize function to use on unsure macro results to make sure they return strings as expected.
+ * @property {(content: string, options?: { trimIndent?: boolean }) => string} trimContent - Trims scoped content with optional indentation dedent. Defaults to trimming indentation.
+ * @property {(text: string) => string} resolve - Evaluates macros in the given text using the same environment. Use when delayArgResolution is true.
  */
 
 /**
@@ -124,6 +136,7 @@ export const MacroValueType = Object.freeze({
  * @property {MacroValueType|MacroValueType[]} returnType - The type(s) this macro returns.
  * @property {string|null} displayOverride - Override for the auto-generated macro signature display.
  * @property {string[]} exampleUsage - Example usage strings for documentation.
+ * @property {boolean} delayArgResolution - If true, nested macros in arguments are NOT resolved before calling the handler. The handler receives raw argument text and must call resolve() manually. Use sparingly - only for control-flow macros like {{if}}.
  * @property {MacroHandler} handler
  * @property {MacroSource} source
  * @property {string|null} aliasOf - If this is an alias, the primary macro name this is an alias of. Can also be used to check if this is an alias macro.
@@ -179,7 +192,7 @@ class MacroRegistry {
         name = typeof name === 'string' ? name.trim() : String(name);
 
         try {
-            if (typeof name !== 'string' || !name) throw new Error('Macro name must be a non-empty string');
+            if (!isIdentifierValid(name)) throw new Error(`Macro name "${name}" is invalid. Must start with a letter, followed by alphanumeric characters or hyphens.`);
             if (!options || typeof options !== 'object') throw new Error(`Macro "${name}" options must be a non-null object.`);
 
             const {
@@ -193,6 +206,7 @@ class MacroRegistry {
                 returnType: rawReturnType,
                 displayOverride: rawDisplayOverride,
                 exampleUsage: rawExampleUsage,
+                delayArgResolution: rawDelayArgResolution,
                 handler,
             } = options;
 
@@ -206,14 +220,18 @@ class MacroRegistry {
                     if (!aliasDef || typeof aliasDef !== 'object') throw new Error(`Macro "${name}" options.aliases[${i}] must be an object.`);
                     if (typeof aliasDef.alias !== 'string' || !aliasDef.alias.trim()) throw new Error(`Macro "${name}" options.aliases[${i}].alias must be a non-empty string.`);
                     const aliasName = aliasDef.alias.trim();
-                    if (aliasName === name) throw new Error(`Macro "${name}" options.aliases[${i}].alias cannot be the same as the macro name.`);
+                    if (!isIdentifierValid(aliasName)) throw new Error(`Macro "${name}" options.aliases[${i}].alias "${aliasName}" is invalid. Must start with a letter, followed by word chars or hyphens.`);
+                    if (aliasName.toLowerCase() === name.toLowerCase()) throw new Error(`Macro "${name}" options.aliases[${i}].alias cannot be the same as the macro name (insensitive).`);
                     const visible = aliasDef.visible !== false; // Default to true
                     aliases.push({ alias: aliasName, visible });
                 }
             }
 
-            if (typeof rawCategory !== 'string' || !rawCategory.trim()) throw new Error(`Macro "${name}" options.category must be a non-empty string.`);
-            const category = rawCategory.trim();
+            /** @type {MacroCategory|string} */
+            let category = MacroCategory.UNCATEGORIZED;
+            if (typeof rawCategory === 'string' && rawCategory.trim()) {
+                category = rawCategory.trim();
+            }
 
             let minArgs = 0;
             let maxArgs = 0;
@@ -344,7 +362,14 @@ class MacroRegistry {
                 }
             }
 
-            if (this.#macros.has(name)) {
+            let delayArgResolution = false;
+            if (rawDelayArgResolution !== undefined) {
+                if (typeof rawDelayArgResolution !== 'boolean') throw new Error(`Macro "${name}" options.delayArgResolution must be a boolean when provided.`);
+                delayArgResolution = rawDelayArgResolution;
+            }
+
+            const nameKey = name.toLowerCase();
+            if (this.#macros.has(nameKey)) {
                 logMacroRegisterWarning({ macroName: name, message: `Macro "${name}" is already registered and will be overwritten.` });
             }
 
@@ -366,6 +391,7 @@ class MacroRegistry {
                 returnType,
                 displayOverride,
                 exampleUsage,
+                delayArgResolution,
                 handler,
                 source: {
                     name: source,
@@ -376,21 +402,22 @@ class MacroRegistry {
                 aliasVisible: null,
             };
 
-            this.#macros.set(name, definition);
+            this.#macros.set(nameKey, definition);
 
             // Register alias entries pointing to the same definition
             for (const { alias, visible } of aliases) {
-                if (this.#macros.has(alias)) {
+                const aliasKey = alias.toLowerCase();
+                if (this.#macros.has(aliasKey)) {
                     logMacroRegisterWarning({ macroName: name, message: `Alias "${alias}" for macro "${name}" overwrites an existing macro.` });
                 }
                 /** @type {MacroDefinition} */
                 const aliasEntry = {
                     ...definition,
-                    name: alias, // The lookup name is the alias
+                    name: alias, // The lookup name is the alias (preserves original casing for display)
                     aliasOf: name,
                     aliasVisible: visible,
                 };
-                this.#macros.set(alias, aliasEntry);
+                this.#macros.set(aliasKey, aliasEntry);
             }
 
             return definition;
@@ -413,7 +440,7 @@ class MacroRegistry {
     unregisterMacro(name) {
         if (typeof name !== 'string' || !name.trim()) throw new Error('Macro name must be a non-empty string');
         name = name.trim();
-        return this.#macros.delete(name);
+        return this.#macros.delete(name.toLowerCase());
     }
 
     /**
@@ -425,7 +452,7 @@ class MacroRegistry {
     hasMacro(name) {
         if (typeof name !== 'string' || !name.trim()) return false;
         name = name.trim();
-        return this.#macros.has(name);
+        return this.#macros.has(name.toLowerCase());
     }
 
     /**
@@ -437,7 +464,7 @@ class MacroRegistry {
     getMacro(name) {
         if (typeof name !== 'string' || !name.trim()) return undefined;
         name = name.trim();
-        return this.#macros.get(name);
+        return this.#macros.get(name.toLowerCase());
     }
 
     /**
@@ -525,11 +552,17 @@ class MacroRegistry {
             unnamedArgs: unnamedArgsValues,
             list: listValues,
             namedArgs,
+            flags: call.flags,
+            isScoped: call.isScoped,
             raw: call.rawInner,
+            rawOriginal: call.rawWithBraces,
+            rawArgs: call.rawArgs,
             env: call.env,
             cstNode: call.cstNode,
             range: call.range,
             normalize: MacroEngine.normalizeMacroResult.bind(MacroEngine),
+            trimContent: MacroEngine.trimScopedContent.bind(MacroEngine),
+            resolve: (text) => MacroEngine.evaluate(text, call.env),
         };
 
         const result = def.handler(executionContext);
@@ -538,6 +571,20 @@ class MacroRegistry {
 }
 
 instance = MacroRegistry.instance;
+
+/**
+ * Validates a macro identifier.
+ *
+ * @param {string} name - The macro identifier to validate.
+ * @param {Object} [options] - Validation options.
+ * @param {boolean} [options.allowComment = true] - Whether return that the comment identifier '//' is valid.
+ * @returns {boolean} True if the identifier is valid, false otherwise.
+ */
+function isIdentifierValid(name, { allowComment = true } = {}) {
+    if (typeof name !== 'string' || !name.trim()) return false;
+    if (allowComment && name === '//') return true;
+    return MACRO_IDENTIFIER_PATTERN.test(name);
+}
 
 /**
  * Validates the arguments for a macro definition.
